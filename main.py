@@ -30,6 +30,12 @@ class PredictRequest(BaseModel):
 class PredictResponse(BaseModel):
     deadlock: int
     confidence: float
+    # --- NEW FIELDS FOR PROBLEM #38 COMPLIANCE ---
+    logical_deadlock: int
+    deadlocked_processes: List[int]
+    safe_sequence: List[int]
+    immediate_runnable: int
+    recommended_action: str = ""
 
 
 app = FastAPI(title="SafeSched Deadlock Prediction API", version="1.0.0")
@@ -58,33 +64,64 @@ def compute_deadlock_from_state(payload: PredictRequest) -> Dict[str, Any]:
         for i in range(p)
     ]
 
-    immediate_runnable = sum(
-        1
+    # Calculate runnability strictly: can they run AND do they hold anything?
+    runnable_indices = [
+        i for i in range(p)
+        if all(need[i][j] <= (work[j] if j < len(work) else 0) for j in range(r))
+    ]
+    
+    # Contributory means they can run and will release resources back to the pool
+    contributory_runnable = [
+        i for i in runnable_indices
+        if any(allocation[i][j] > 0 for j in range(r))
+    ]
+
+    # Initial state: processes that hold nothing AND need nothing are effectively finished
+    finish = [
+        all(allocation[i][j] == 0 for j in range(r)) and all(need[i][j] <= 0 for j in range(r))
         for i in range(p)
-        if all(need[i][j] <= work[j] for j in range(r))
-    )
-
-    # Deadlock detection loop using progress over finish flags.
-    finish = [all(allocation[i][j] == 0 for j in range(r)) for i in range(p)]
-    made_progress = True
-    while made_progress:
-        made_progress = False
+    ]
+    
+    # Process safety algorithm
+    current_work = payload.available[:]  # Use a local copy to avoid modifying original available
+    safe_sequence = []
+    
+    # Banker's safety check
+    while True:
+        found_next = False
         for i in range(p):
-            if finish[i]:
-                continue
-            if all(need[i][j] <= work[j] for j in range(r)):
-                for j in range(r):
-                    work[j] += allocation[i][j]
-                finish[i] = True
-                made_progress = True
+            if not finish[i]:
+                # Can process i be satisfied?
+                if all(need[i][j] <= current_work[j] for j in range(r)):
+                    # Release held resources to work vector
+                    for j in range(r):
+                        current_work[j] += allocation[i][j]
+                    finish[i] = True
+                    safe_sequence.append(i)
+                    found_next = True
+                    # Restart once we've made progress to re-check all blocked processes
+        if not found_next:
+            break
 
-    deadlocked_processes = [i for i in range(p) if not finish[i]]
-    logical_deadlock = int(len(deadlocked_processes) > 0)
+    # If any process that holds resources is not finished, we have a deadlock
+    deadlocked_processes = [i for i in range(p) if not finish[i] and any(allocation[i][j] > 0 for j in range(r))]
+    logical_deadlock = 1 if len(deadlocked_processes) > 0 else 0
+
+    # Simple resolution strategy: if deadlocked, suggest process with most resources
+    recommended_action = ""
+    if logical_deadlock:
+        resource_counts = [sum(allocation[pid]) for pid in deadlocked_processes]
+        victim_idx = resource_counts.index(max(resource_counts))
+        victim_pid = deadlocked_processes[victim_idx]
+        recommended_action = f"Terminate Process {victim_pid} to release {sum(allocation[victim_pid])} resources."
 
     return {
         "logical_deadlock": logical_deadlock,
         "deadlocked_processes": deadlocked_processes,
-        "immediate_runnable_processes": int(immediate_runnable),
+        "safe_sequence": safe_sequence,
+        "immediate_runnable": len(runnable_indices),
+        "contributory_feasible_now": len(contributory_runnable),
+        "recommended_action": recommended_action,
     }
 
 
@@ -190,6 +227,17 @@ def build_engineered_features(payload: PredictRequest) -> Dict[str, float]:
     )
     blocked_processes = int(max(p - num_executable_processes, 0))
 
+    # Count how many can run and WILL release resources (the 'contributory' check)
+    contributory_feasible_now = 0
+    for i in range(p):
+        can_run = all(
+            payload.max_matrix[i][j] - payload.allocation_matrix[i][j] <= payload.available[j]
+            for j in range(r)
+        )
+        has_resources = any(payload.allocation_matrix[i][j] > 0 for j in range(r))
+        if can_run and has_resources:
+            contributory_feasible_now += 1
+
     total_resources = float(total_allocation + total_available)
     fraction_blocked = float(blocked_processes / p) if p > 0 else 0.0
     utilization_ratio = float(total_allocation / total_resources) if total_resources > 0 else 0.0
@@ -207,6 +255,7 @@ def build_engineered_features(payload: PredictRequest) -> Dict[str, float]:
         "total_need": total_need,
         "total_available": total_available,
         "num_executable_processes": float(num_executable_processes),
+        "contributory_feasible_now": float(contributory_feasible_now), # New Feature for the model
         "blocked_processes": float(blocked_processes),
         "fraction_blocked": fraction_blocked,
         "utilization_ratio": utilization_ratio,
@@ -256,6 +305,9 @@ def predict(payload: PredictRequest) -> PredictResponse:
     validate_state(payload)
     engineered = build_engineered_features(payload)
     model_input = to_model_frame(engineered)
+    
+    # Get logical/Banker's info from Simulation logic
+    logic_results = compute_deadlock_from_state(payload)
 
     try:
         if hasattr(MODEL_PIPELINE, "predict_proba"):
@@ -272,7 +324,15 @@ def predict(payload: PredictRequest) -> PredictResponse:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Prediction failed: {exc}") from exc
 
-    return PredictResponse(deadlock=deadlock, confidence=confidence)
+    return PredictResponse(
+        deadlock=deadlock,
+        confidence=confidence,
+        logical_deadlock=logic_results["logical_deadlock"],
+        deadlocked_processes=logic_results["deadlocked_processes"],
+        safe_sequence=logic_results["safe_sequence"],
+        immediate_runnable=logic_results["immediate_runnable"],
+        recommended_action=logic_results["recommended_action"]
+    )
 
 
 if __name__ == "__main__":
