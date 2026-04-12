@@ -32,6 +32,7 @@ class PredictResponse(BaseModel):
     confidence: float
     # --- NEW FIELDS FOR PROBLEM #38 COMPLIANCE ---
     logical_deadlock: int
+    is_starvation: bool  # New field to distinguish starvation from deadlock
     deadlocked_processes: List[int]
     safe_sequence: List[int]
     immediate_runnable: int
@@ -107,6 +108,15 @@ def compute_deadlock_from_state(payload: PredictRequest) -> Dict[str, Any]:
     deadlocked_processes = [i for i in range(p) if not finish[i] and any(allocation[i][j] > 0 for j in range(r))]
     logical_deadlock = 1 if len(deadlocked_processes) > 0 else 0
 
+    # Distinguish between Deadlock (Circular dependency) vs Starvation (Insufficient resources)
+    # A true Coffman deadlock requires processes holding resources while waiting for others.
+    # If no one can run but no one is holding resources, it's starvation/permanent block.
+    is_starvation = False
+    if not all(finish):
+        # If no one is deadlocked (holding resources) but some are not finished
+        if logical_deadlock == 0:
+            is_starvation = True
+
     # Simple resolution strategy: if deadlocked, suggest process with most resources
     recommended_action = ""
     if logical_deadlock:
@@ -114,9 +124,12 @@ def compute_deadlock_from_state(payload: PredictRequest) -> Dict[str, Any]:
         victim_idx = resource_counts.index(max(resource_counts))
         victim_pid = deadlocked_processes[victim_idx]
         recommended_action = f"Terminate Process {victim_pid} to release {sum(allocation[victim_pid])} resources."
+    elif is_starvation:
+        recommended_action = "System Starvation: Current resources insufficient to start any process."
 
     return {
         "logical_deadlock": logical_deadlock,
+        "is_starvation": is_starvation,
         "deadlocked_processes": deadlocked_processes,
         "safe_sequence": safe_sequence,
         "immediate_runnable": len(runnable_indices),
@@ -328,6 +341,7 @@ def predict(payload: PredictRequest) -> PredictResponse:
         deadlock=deadlock,
         confidence=confidence,
         logical_deadlock=logic_results["logical_deadlock"],
+        is_starvation=logic_results["is_starvation"],
         deadlocked_processes=logic_results["deadlocked_processes"],
         safe_sequence=logic_results["safe_sequence"],
         immediate_runnable=logic_results["immediate_runnable"],
